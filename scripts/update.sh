@@ -7,7 +7,7 @@
 # Once a model lands, score_live.py will produce real picks and the existing
 # append/resolve/summarize chain will fill the ledger.
 set -uo pipefail
-cd /Users/Ryan/boxing-odds-daemon
+cd /Users/Ryan/gt/boxing_predictor
 
 echo "🥊 Boxing Pipeline — $(date '+%Y-%m-%d %H:%M %Z')"
 echo
