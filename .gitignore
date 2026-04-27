@@ -1,6 +1,8 @@
 __pycache__/
 *.pyc
 data/raw_html/
+data/cache/
+data/reports/
 data/live_odds/
 data/processed/bfo_corpus/
 data/processed/bfo_corpus_recent/
