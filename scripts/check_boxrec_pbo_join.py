@@ -33,6 +33,10 @@ BOXREC_RESULTS_CSV = ROOT / "data" / "raw" / "boxer_results_boxrec.csv"
 REPORT_PATH = ROOT / "data" / "reports" / "pbo_boxrec_join_coverage.md"
 DATE_TOLERANCE_DAYS = 2
 
+# These get overwritten in main() when --results / --report are passed.
+RESULTS_CSV: Path = BOXREC_RESULTS_CSV
+ACTIVE_REPORT_PATH: Path = REPORT_PATH
+
 SUFFIXES = {"jr", "jr.", "junior", "jnr", "sr", "sr.", "senior", "snr",
             "ii", "iii", "iv"}
 NICK_RE = re.compile(r'["“”‘’\'`]([^"“”‘’\'`]+)["“”‘’\'`]')
@@ -92,16 +96,16 @@ def load_pbo() -> list[dict]:
 
 
 def load_boxrec_index() -> dict[tuple[str, ...], list[dict]]:
-    """Index BoxRec fights by sorted-pair key."""
+    """Index source fights by sorted-pair key."""
     idx: dict[tuple[str, ...], list[dict]] = defaultdict(list)
-    if not BOXREC_RESULTS_CSV.exists():
+    if not RESULTS_CSV.exists():
         print(
-            f"WARNING: {BOXREC_RESULTS_CSV} not found -- coverage will be 0%. "
-            "Run scrape_boxrec_bulk.py first.",
+            f"WARNING: {RESULTS_CSV} not found -- coverage will be 0%. "
+            "Run a scraper first.",
             file=sys.stderr,
         )
         return idx
-    with BOXREC_RESULTS_CSV.open() as f:
+    with RESULTS_CSV.open() as f:
         for r in csv.DictReader(f):
             d = parse_date(r.get("fight_date", ""))
             if d is None:
@@ -161,14 +165,17 @@ def render_report(joined: list[dict]) -> str:
     lines.append("")
     lines.append(f"**Inputs**")
     lines.append(f"- PBO bouts: `{PBO_RESULTS_CSV.relative_to(ROOT)}` ({n} rows)")
-    if BOXREC_RESULTS_CSV.exists():
-        with BOXREC_RESULTS_CSV.open() as f:
-            n_boxrec = sum(1 for _ in f) - 1
+    if RESULTS_CSV.exists():
+        with RESULTS_CSV.open() as f:
+            n_src = sum(1 for _ in f) - 1
     else:
-        n_boxrec = 0
+        n_src = 0
+    try:
+        src_label = RESULTS_CSV.resolve().relative_to(ROOT).as_posix()
+    except ValueError:
+        src_label = str(RESULTS_CSV)
     lines.append(
-        f"- BoxRec fights: `{BOXREC_RESULTS_CSV.relative_to(ROOT)}` "
-        f"({max(n_boxrec, 0)} rows)"
+        f"- Source fights: `{src_label}` ({max(n_src, 0)} rows)"
     )
     lines.append("")
     lines.append("## Headline")
@@ -216,9 +223,17 @@ def render_report(joined: list[dict]) -> str:
 
 
 def main(argv: list[str] | None = None) -> int:
+    global RESULTS_CSV, ACTIVE_REPORT_PATH
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n", 1)[0])
     ap.add_argument("--quiet", action="store_true")
+    ap.add_argument("--results", type=Path, default=BOXREC_RESULTS_CSV,
+                    help="path to scraped boxer fights CSV")
+    ap.add_argument("--report", type=Path, default=REPORT_PATH,
+                    help="output markdown report path")
     args = ap.parse_args(argv)
+
+    RESULTS_CSV = args.results
+    ACTIVE_REPORT_PATH = args.report
 
     pbo = load_pbo()
     idx = load_boxrec_index()
@@ -227,14 +242,15 @@ def main(argv: list[str] | None = None) -> int:
     n_match = sum(1 for r in joined if r["matched"])
     pct = (100.0 * n_match / n) if n else 0.0
 
-    REPORT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    REPORT_PATH.write_text(render_report(joined), encoding="utf-8")
+    ACTIVE_REPORT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    ACTIVE_REPORT_PATH.write_text(render_report(joined), encoding="utf-8")
 
     if not args.quiet:
         print(f"PBO bouts          : {n}")
-        print(f"Matched in BoxRec  : {n_match} ({pct:.2f}%)")
+        print(f"Matched in source  : {n_match} ({pct:.2f}%)")
+        print(f"Source CSV         : {RESULTS_CSV}")
         print(f"Date tolerance     : ±{DATE_TOLERANCE_DAYS} days")
-        print(f"Report             : {REPORT_PATH}")
+        print(f"Report             : {ACTIVE_REPORT_PATH}")
 
         # Per-year breakdown
         by_year: Counter = Counter()
