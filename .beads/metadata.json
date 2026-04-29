@@ -1,7 +1,9 @@
 {
   "database": "dolt",
   "backend": "dolt",
-  "dolt_mode": "embedded",
-  "dolt_database": "boxing_predictor",
+  "dolt_mode": "server",
+  "dolt_server_host": "127.0.0.1",
+  "dolt_server_port": 3307,
+  "dolt_database": "bx",
   "project_id": "e7dc9e43-37d2-4fef-bd62-24af783cae08"
 }
