@@ -17,6 +17,14 @@ Features per (boxer_id, bout_date):
   avg_opp_glicko_last5
   is_debut
 
+  -- G4 expansion (bx-zz7) --
+  height_cm, reach_cm, reach_to_height_ratio   (from data/processed/tapology_attrs.csv;
+                                                NaN where Tapology profile not scraped)
+  ko_win_rate_10, tko_loss_rate_10, dec_rate_10  (method dist over last 10 decisive fights)
+  avg_scheduled_rounds_10                        (mean of scheduled-round count over last 10)
+  inactive_180d_flag, inactive_365d_flag         (binary; based on days_since_last)
+  opp_glicko_min_last5, opp_glicko_std_last5     (schedule-strength dispersion)
+
 Output: data/processed/boxer_features.csv
 
 Glicko-2: mu0=1500, phi0=350, sigma0=0.06, tau=0.5; time decay between bouts
@@ -35,6 +43,7 @@ import pandas as pd
 
 REPO = Path(__file__).resolve().parent.parent
 UNION_CSV = REPO / "data" / "raw" / "boxer_results_union.csv"
+ATTRS_CSV = REPO / "data" / "processed" / "tapology_attrs.csv"
 OUT_CSV = REPO / "data" / "processed" / "boxer_features.csv"
 
 GLICKO_SCALE = 173.7178
@@ -117,10 +126,37 @@ def inflate_phi(phi: float, sigma: float, days: float) -> float:
     return min(new_phi, GLICKO_PHI0 / GLICKO_SCALE)
 
 
+def load_attrs() -> dict[int, dict]:
+    """Load fighter attributes from tapology_attrs.csv. Returns
+    {fighter_id (int): {"height_cm": float|nan, "reach_cm": float|nan,
+                        "ratio": float|nan}}.
+    """
+    if not ATTRS_CSV.exists():
+        print(f"  WARN: {ATTRS_CSV.name} not found; height/reach features = NaN")
+        return {}
+    a = pd.read_csv(ATTRS_CSV, low_memory=False)
+    a["fighter_id"] = pd.to_numeric(a["fighter_id"], errors="coerce")
+    a = a.dropna(subset=["fighter_id"]).copy()
+    a["fighter_id"] = a["fighter_id"].astype("int64")
+    a["height_cm"] = pd.to_numeric(a["height_cm"], errors="coerce")
+    a["reach_cm"] = pd.to_numeric(a["reach_cm"], errors="coerce")
+    out: dict[int, dict] = {}
+    for r in a.itertuples(index=False):
+        h = float(r.height_cm) if r.height_cm == r.height_cm else float("nan")
+        rc = float(r.reach_cm) if r.reach_cm == r.reach_cm else float("nan")
+        ratio = (rc / h) if (rc == rc and h == h and h > 0) else float("nan")
+        out[int(r.fighter_id)] = {"height_cm": h, "reach_cm": rc, "ratio": ratio}
+    print(f"  attrs loaded for {len(out):,} fighters "
+          f"(height={a['height_cm'].notna().sum():,}, "
+          f"reach={a['reach_cm'].notna().sum():,})")
+    return out
+
+
 def main() -> int:
     print(f"Loading {UNION_CSV.name} ...")
     df = pd.read_csv(UNION_CSV, parse_dates=["fight_date"], low_memory=False)
     print(f"  rows: {len(df):,}")
+    attrs = load_attrs()
 
     df = df.dropna(subset=["fight_date", "boxer_id", "opp_id"]).copy()
     df["boxer_id"] = pd.to_numeric(df["boxer_id"], errors="coerce")
@@ -130,6 +166,7 @@ def main() -> int:
     df["opp_id"] = df["opp_id"].astype("int64")
     df["result"] = df["result"].astype(str).str.upper().replace({"NAN": ""})
     df["method_norm"] = df["method"].map(_norm_method)
+    df["sched_rounds"] = pd.to_numeric(df["round"], errors="coerce")
 
     # Build canonical bouts: one row per (date, sorted-pair).
     df["a_id"] = df[["boxer_id", "opp_id"]].min(axis=1).astype("int64")
@@ -164,6 +201,7 @@ def main() -> int:
                 "career_wins": 0, "career_losses": 0, "career_draws": 0, "career_nc": 0,
                 "career_ko_wins": 0, "career_tko_wins": 0, "career_dec_wins": 0,
                 "career_tko_losses": 0,
+                # rolling-10 (date, result_letter, method_norm, sched_rounds)
                 "results": deque(maxlen=10),
                 "all_dates": [],
                 "opp_glicko_last5": deque(maxlen=5),
@@ -195,15 +233,29 @@ def main() -> int:
 
         def winpct(buf):
             if not buf: return float("nan")
-            wins = sum(1 for _, r, _ in buf if r == "W")
-            denom = sum(1 for _, r, _ in buf if r in ("W", "L", "D"))
+            wins = sum(1 for _, r, _, _ in buf if r == "W")
+            denom = sum(1 for _, r, _, _ in buf if r in ("W", "L", "D"))
             return wins / denom if denom else float("nan")
 
         def kopct(buf):
             if not buf: return float("nan")
-            kos = sum(1 for _, r, m in buf if r == "W" and m in KO_TOKENS)
-            denom = sum(1 for _, r, _ in buf if r == "W")
+            kos = sum(1 for _, r, m, _ in buf if r == "W" and m in KO_TOKENS)
+            denom = sum(1 for _, r, _, _ in buf if r == "W")
             return kos / denom if denom else float("nan")
+
+        # Method-distribution rates over last 10 (denominator = decisive fights in window)
+        decisive10 = [(_d, r, m) for _d, r, m, _sr in last10 if r in ("W", "L")]
+        denom10 = len(decisive10)
+        if denom10:
+            ko_w_rate10 = sum(1 for _d, r, m in decisive10 if r == "W" and m in KO_TOKENS) / denom10
+            tko_l_rate10 = sum(1 for _d, r, m in decisive10 if r == "L" and m in KO_TOKENS) / denom10
+            dec_rate10 = sum(1 for _d, r, m in decisive10 if m in DEC_TOKENS) / denom10
+        else:
+            ko_w_rate10 = tko_l_rate10 = dec_rate10 = float("nan")
+
+        # Average scheduled rounds over last 10 fights with a round value
+        sr_vals = [sr for _d, _r, _m, sr in last10 if sr is not None and not math.isnan(sr)]
+        avg_sched_rounds10 = (sum(sr_vals) / len(sr_vals)) if sr_vals else float("nan")
 
         all_dates = s["all_dates"]
         days_since = (fdate - all_dates[-1]).days if all_dates else float("nan")
@@ -214,7 +266,37 @@ def main() -> int:
                 idx += 1
             else:
                 break
-        avg_opp_g = (sum(s["opp_glicko_last5"]) / len(s["opp_glicko_last5"])) if s["opp_glicko_last5"] else float("nan")
+        # Inactivity flags (binary; 0 if first fight)
+        if math.isnan(days_since) if isinstance(days_since, float) else False:
+            inactive_180 = 0
+            inactive_365 = 0
+        elif all_dates:
+            inactive_180 = int(days_since > 180)
+            inactive_365 = int(days_since > 365)
+        else:
+            inactive_180 = 0
+            inactive_365 = 0
+
+        opp_glicko_buf = list(s["opp_glicko_last5"])
+        if opp_glicko_buf:
+            avg_opp_g = sum(opp_glicko_buf) / len(opp_glicko_buf)
+            min_opp_g = min(opp_glicko_buf)
+            if len(opp_glicko_buf) > 1:
+                mean_o = avg_opp_g
+                var_o = sum((x - mean_o) ** 2 for x in opp_glicko_buf) / (len(opp_glicko_buf) - 1)
+                std_opp_g = math.sqrt(var_o)
+            else:
+                std_opp_g = 0.0
+        else:
+            avg_opp_g = float("nan")
+            min_opp_g = float("nan")
+            std_opp_g = float("nan")
+
+        # Stylistic from tapology_attrs
+        a = attrs.get(fid, None)
+        height_cm = a["height_cm"] if a else float("nan")
+        reach_cm = a["reach_cm"] if a else float("nan")
+        ratio = a["ratio"] if a else float("nan")
 
         return {
             "fight_date": fdate, "boxer_id": fid, "opp_id": opp_id,
@@ -227,6 +309,17 @@ def main() -> int:
             "glicko_phi": g["phi"] * GLICKO_SCALE,
             "glicko_sigma": g["sigma"], "avg_opp_glicko_last5": avg_opp_g,
             "is_debut": int(cf == 0),
+            # G4 expansion
+            "height_cm": height_cm, "reach_cm": reach_cm,
+            "reach_to_height_ratio": ratio,
+            "ko_win_rate_10": ko_w_rate10,
+            "tko_loss_rate_10": tko_l_rate10,
+            "dec_rate_10": dec_rate10,
+            "avg_scheduled_rounds_10": avg_sched_rounds10,
+            "inactive_180d_flag": inactive_180,
+            "inactive_365d_flag": inactive_365,
+            "opp_glicko_min_last5": min_opp_g,
+            "opp_glicko_std_last5": std_opp_g,
         }
 
     out_rows = []
@@ -238,6 +331,9 @@ def main() -> int:
         fdate = b.fight_date
         a_res = b.a_result
         method = b.method_norm
+        sched_r = float(b.sched_rounds) if (
+            b.sched_rounds == b.sched_rounds  # not nan
+        ) else float("nan")
 
         # Emit pre-fight features for both
         out_rows.append(emit_features(a_id, fdate, b_id))
@@ -283,9 +379,9 @@ def main() -> int:
             sb["career_nc"] += 1
 
         if a_res in ("W", "L", "D"):
-            sa["results"].append((fdate, a_res, a_method))
+            sa["results"].append((fdate, a_res, a_method, sched_r))
             b_res = {"W": "L", "L": "W", "D": "D"}[a_res]
-            sb["results"].append((fdate, b_res, a_method))
+            sb["results"].append((fdate, b_res, a_method, sched_r))
         sa["all_dates"].append(fdate)
         sb["all_dates"].append(fdate)
 

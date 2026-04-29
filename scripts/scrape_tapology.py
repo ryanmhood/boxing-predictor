@@ -473,35 +473,58 @@ def main(argv: list[str] | None = None) -> int:
     n_resolved = 0
     n_failed_search = 0
     n_failed_profile = 0
+    n_skipped_rl = 0
+    rate_limited = False  # once tripped, fall back to cache-only mode
     started = time.time()
 
     for i, t in enumerate(targets, 1):
         name = t["name"]
+        # Cache-only mode after a 503: skip targets whose search cache
+        # is missing rather than burning more HTTP requests at the wall.
+        if rate_limited:
+            search_cache = HTML_CACHE / f"search_{safe_filename(name)}.html"
+            if not search_cache.exists() or search_cache.stat().st_size <= 1024:
+                n_skipped_rl += 1
+                continue
         fid, slug, err = search_fighter(sess, name)
         if not fid:
             n_failed_search += 1
-            print(f"[tap] {i}/{len(targets)} {name!r} search FAILED ({err})")
-            if "503" in err:
+            if "503" in err and not rate_limited:
+                rate_limited = True
                 print(
-                    "[tap] >> abort: Tapology returned 503 (rate-limited). "
-                    "Wait 10-15 min, then re-run with --resume --delay 3.0."
+                    f"[tap] {i}/{len(targets)} {name!r} search 503 -- "
+                    "switching to cache-only mode for remaining targets"
                 )
-                break
+                continue
+            if not rate_limited:
+                print(f"[tap] {i}/{len(targets)} {name!r} search FAILED ({err})")
             continue
         html, err = fetch_profile(sess, fid, slug or "")
         if not html:
             n_failed_profile += 1
-            print(f"[tap] {i}/{len(targets)} {name!r} (id={fid}) profile FAILED ({err})")
+            if "503" in err and not rate_limited:
+                rate_limited = True
+                print(
+                    f"[tap] {i}/{len(targets)} {name!r} (id={fid}) "
+                    "profile 503 -- switching to cache-only mode"
+                )
+                continue
+            if not rate_limited:
+                print(
+                    f"[tap] {i}/{len(targets)} {name!r} (id={fid}) "
+                    f"profile FAILED ({err})"
+                )
             continue
         n_resolved += 1
         fights = parse_profile_record(html, fid, name)
         all_fights.extend(fights)
-        if i % 10 == 0 or i == len(targets):
+        if i % 50 == 0 or i == len(targets):
             elapsed = time.time() - started
+            mode = "CACHE-ONLY" if rate_limited else "live"
             print(
-                f"[tap] {i}/{len(targets)} resolved={n_resolved} "
+                f"[tap] {i}/{len(targets)} [{mode}] resolved={n_resolved} "
                 f"fights={len(all_fights)} req={sess.request_count} "
-                f"t={elapsed:.0f}s"
+                f"skipped_rl={n_skipped_rl} t={elapsed:.0f}s"
             )
 
     write_results(all_fights)
@@ -514,6 +537,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"resolved profiles        : {n_resolved}")
     print(f"failed searches          : {n_failed_search}")
     print(f"failed profile fetches   : {n_failed_profile}")
+    print(f"skipped (rate-limit)     : {n_skipped_rl}")
     print(f"total fight rows written : {len(all_fights)}")
     print(f"http requests issued     : {sess.request_count}")
     print(f"output                   : {RESULTS_CSV}")

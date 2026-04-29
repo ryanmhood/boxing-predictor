@@ -36,6 +36,12 @@ FEATURE_COLS_NUMERIC = [
     "glicko_mu", "glicko_phi", "glicko_sigma",
     "avg_opp_glicko_last5",
     "is_debut",
+    # G4 expansion (bx-zz7)
+    "height_cm", "reach_cm", "reach_to_height_ratio",
+    "ko_win_rate_10", "tko_loss_rate_10", "dec_rate_10",
+    "avg_scheduled_rounds_10",
+    "inactive_180d_flag", "inactive_365d_flag",
+    "opp_glicko_min_last5", "opp_glicko_std_last5",
 ]
 
 

@@ -44,6 +44,12 @@ FEATURE_COLS_NUMERIC = [
     "glicko_mu", "glicko_phi", "glicko_sigma",
     "avg_opp_glicko_last5",
     "is_debut",
+    # G4 expansion (bx-zz7)
+    "height_cm", "reach_cm", "reach_to_height_ratio",
+    "ko_win_rate_10", "tko_loss_rate_10", "dec_rate_10",
+    "avg_scheduled_rounds_10",
+    "inactive_180d_flag", "inactive_365d_flag",
+    "opp_glicko_min_last5", "opp_glicko_std_last5",
 ]
 
 
@@ -65,6 +71,50 @@ def fit_platt(p_raw: np.ndarray, y: np.ndarray) -> tuple[float, float]:
     lr = LogisticRegression(C=1e6, solver="lbfgs")
     lr.fit(logit.reshape(-1, 1), y)
     return float(lr.coef_[0, 0]), float(lr.intercept_[0])
+
+
+def tier_label(p_raw: float) -> str:
+    """Three-tier bucketing based on raw model_p (G4: bx-zz7).
+
+      heavy: p >= 0.85 OR p <= 0.15  (the dominant-favorite extremes)
+      mid:   0.35 <= p <= 0.65       (close fights)
+      light: 0.15 < p < 0.35 OR 0.65 < p < 0.85
+    """
+    if p_raw >= 0.85 or p_raw <= 0.15:
+        return "heavy"
+    if 0.35 <= p_raw <= 0.65:
+        return "mid"
+    return "light"
+
+
+def fit_tier_platts(p_raw: np.ndarray, y: np.ndarray) -> dict[str, tuple[float, float, int]]:
+    """Fit one Platt per tier. Returns {tier: (a, b, n_samples)}.
+
+    Falls back to the global Platt for any tier with too few samples (<50)
+    to keep the calibration well-conditioned. The fallback is encoded by
+    setting (a, b) to the global fit — the caller can detect this via
+    n_samples == 0 if needed.
+    """
+    a_g, b_g = fit_platt(p_raw, y)
+    out: dict[str, tuple[float, float, int]] = {}
+    tiers = np.array([tier_label(p) for p in p_raw])
+    for t in ("heavy", "mid", "light"):
+        mask = tiers == t
+        n = int(mask.sum())
+        if n < 50:
+            out[t] = (a_g, b_g, 0)  # fallback to global
+            continue
+        # Need both classes to fit logistic
+        y_t = y[mask]
+        if len(set(y_t)) < 2:
+            out[t] = (a_g, b_g, 0)
+            continue
+        try:
+            a_t, b_t = fit_platt(p_raw[mask], y_t)
+            out[t] = (a_t, b_t, n)
+        except Exception:
+            out[t] = (a_g, b_g, 0)
+    return out
 
 
 def apply_platt(p_raw: np.ndarray, a: float, b: float) -> np.ndarray:
@@ -126,13 +176,22 @@ def main() -> int:
 
         p_holdout_raw = model.predict(X_holdout)
         a_platt, b_platt = fit_platt(p_holdout_raw, y_holdout)
+        # G4: per-tier Platts on the same calibration holdout
+        tier_platts = fit_tier_platts(p_holdout_raw, y_holdout)
         p_eval_raw = model.predict(X_eval)
         p_eval_cal = apply_platt(p_eval_raw, a_platt, b_platt)
+        # Per-tier calibrated probs at eval time (each row routed by raw p)
+        p_eval_cal_tier = np.zeros_like(p_eval_raw)
+        for i_row, p in enumerate(p_eval_raw):
+            t = tier_label(float(p))
+            a_t, b_t, _ = tier_platts[t]
+            p_eval_cal_tier[i_row] = float(apply_platt(np.array([p]), a_t, b_t)[0])
 
         base_rate = float(y_train_full.mean())
         brier_base = brier_score_loss(y_eval, np.full_like(y_eval, base_rate, dtype=float))
         brier_raw = brier_score_loss(y_eval, p_eval_raw)
         brier_cal = brier_score_loss(y_eval, p_eval_cal)
+        brier_cal_tier = brier_score_loss(y_eval, p_eval_cal_tier)
         ll_raw = log_loss(y_eval, np.clip(p_eval_raw, 1e-6, 1 - 1e-6))
         ll_cal = log_loss(y_eval, np.clip(p_eval_cal, 1e-6, 1 - 1e-6))
         auc = roc_auc_score(y_eval, p_eval_raw) if len(set(y_eval)) > 1 else float("nan")
@@ -143,6 +202,14 @@ def main() -> int:
         model.save_model(str(ydir / "model.txt"))
         with open(ydir / "platt.json", "w") as f:
             json.dump({"a": a_platt, "b": b_platt, "base_rate": base_rate}, f)
+        # Per-tier scalers (bx-zz7 part C)
+        for t, (a_t, b_t, n_t) in tier_platts.items():
+            with open(ydir / f"platt_{t}.json", "w") as f:
+                json.dump(
+                    {"a": a_t, "b": b_t, "n_train": n_t,
+                     "fallback_to_global": int(n_t == 0)},
+                    f,
+                )
         with open(ydir / "feature_list.json", "w") as f:
             json.dump(feat_cols, f)
 
@@ -154,17 +221,24 @@ def main() -> int:
             "brier_baseline": brier_base,
             "brier_raw": brier_raw,
             "brier_cal": brier_cal,
+            "brier_cal_tier": brier_cal_tier,
             "brier_improvement_vs_base": brier_base - brier_cal,
+            "brier_improvement_tier_vs_global": brier_cal - brier_cal_tier,
             "logloss_raw": ll_raw,
             "logloss_cal": ll_cal,
             "auc": auc,
             "platt_a": a_platt,
             "platt_b": b_platt,
+            "n_heavy": tier_platts["heavy"][2],
+            "n_mid": tier_platts["mid"][2],
+            "n_light": tier_platts["light"][2],
         }
         metrics.append(row)
         print(f"YEAR {year}: train={len(train):,} eval={len(evald):,} base={base_rate:.3f}  "
-              f"brier_base={brier_base:.4f} brier_cal={brier_cal:.4f} (Δ={brier_base-brier_cal:+.4f})  "
-              f"auc={auc:.3f}  platt(a,b)=({a_platt:.3f},{b_platt:.3f})")
+              f"brier_base={brier_base:.4f} brier_cal={brier_cal:.4f} "
+              f"brier_tier={brier_cal_tier:.4f} (Δ={brier_base-brier_cal:+.4f})  "
+              f"auc={auc:.3f}  platts heavy/mid/light n={tier_platts['heavy'][2]}/"
+              f"{tier_platts['mid'][2]}/{tier_platts['light'][2]}")
 
     pd.DataFrame(metrics).to_csv(METRICS_CSV, index=False)
     print(f"\nWrote walk-forward metrics -> {METRICS_CSV}")
