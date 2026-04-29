@@ -2,21 +2,23 @@
 
 For every PBO bout in pbo_scoring_features.parquet:
   1. Load the year-Y model (trained on [2010..Y-1]) and platt params.
-  2. Compute model_p_a (calibrated).
-  3. Devig PBO consensus prices to get market_p_a (subtract overround
-     proportionally — symmetric devig).
+  2. Compute model_p_a (calibrated). G4 (bx-zz7): the calibrated prob
+     uses a per-tier Platt scaler routed by the raw model_p (heavy /
+     mid / light).
+  3. Devig PBO consensus prices to get market_p_a (symmetric devig).
   4. edge_a = model_p_a - market_p_a.
-  5. Gate: |edge| >= 3pp AND market_p_a in [0.10, 0.90] for the side with
-     positive edge (asymmetric since boxing has heavy favorites — gate
-     applies to whichever side we'd bet on).
+  5. Three strategies evaluated in parallel (G4 part D):
+       - Global:       |edge| >= 3pp, market_p in [0.10, 0.90]
+       - Mid-tier:     |edge| >= 3pp, market_p in [0.35, 0.65]
+       - Heavy-fav:    market_p > 0.85, bet ML if model agrees within 5pp
+                       (sanity check vs the naive "always-favorite" line)
   6. PnL: $1 stake, payout from American odds. Computes ROI at PBO median
-     and at PBO median * 1.05 (5% vig haircut for realism).
+     and at PBO median * 0.95 (5% vig haircut for realism).
 
 Outputs:
   - data/processed/boxing_backtest_picks.csv (every bout, with model probs,
-    edge, decision, outcome, PnL)
-  - per-year ROI table -> stdout + data/reports/boxing_backtest_summary.csv
-  - per-tier ROI table (heavy-fav market_p > 0.65, mid 0.35..0.65, dog < 0.35)
+    edge, decision-per-strategy, outcome, PnL)
+  - per-year + per-strategy ROI tables -> stdout + data/reports/boxing_backtest_summary.csv
 """
 
 from __future__ import annotations
@@ -69,6 +71,27 @@ def apply_platt(p_raw: np.ndarray, a: float, b: float) -> np.ndarray:
     return 1.0 / (1.0 + np.exp(-z))
 
 
+def tier_label(p_raw: float) -> str:
+    if p_raw >= 0.85 or p_raw <= 0.15:
+        return "heavy"
+    if 0.35 <= p_raw <= 0.65:
+        return "mid"
+    return "light"
+
+
+def apply_platt_per_tier(
+    p_raw: np.ndarray, tier_platts: dict[str, dict]
+) -> np.ndarray:
+    """Route each row to its tier's Platt scaler based on raw p."""
+    out = np.zeros_like(p_raw)
+    for i, p in enumerate(p_raw):
+        t = tier_label(float(p))
+        a = tier_platts[t]["a"]
+        b = tier_platts[t]["b"]
+        out[i] = float(apply_platt(np.array([float(p)]), a, b)[0])
+    return out
+
+
 def main() -> int:
     print(f"Loading {SCORE_PARQUET.name} ...")
     df = pd.read_parquet(SCORE_PARQUET)
@@ -85,14 +108,27 @@ def main() -> int:
         booster = lgb.Booster(model_file=str(ydir / "model.txt"))
         platt = json.loads((ydir / "platt.json").read_text())
         feat_list = json.loads((ydir / "feature_list.json").read_text())
-        by_year_models[int(year)] = {"booster": booster, "platt": platt, "feats": feat_list}
+        # G4: per-tier Platt scalers (graceful fallback to global if missing)
+        tier_platts: dict[str, dict] = {}
+        for t in ("heavy", "mid", "light"):
+            p_path = ydir / f"platt_{t}.json"
+            if p_path.exists():
+                tier_platts[t] = json.loads(p_path.read_text())
+            else:
+                tier_platts[t] = platt
+        by_year_models[int(year)] = {
+            "booster": booster, "platt": platt, "feats": feat_list,
+            "tier_platts": tier_platts,
+        }
 
         Xy = gdf[feat_list].astype("float32").values
         p_raw = booster.predict(Xy)
-        p_cal = apply_platt(p_raw, platt["a"], platt["b"])
+        p_cal_global = apply_platt(p_raw, platt["a"], platt["b"])
+        p_cal_tier = apply_platt_per_tier(p_raw, tier_platts)
         gdf = gdf.copy()
         gdf["model_p_a_raw"] = p_raw
-        gdf["model_p_a"] = p_cal
+        gdf["model_p_a_global"] = p_cal_global
+        gdf["model_p_a"] = p_cal_tier  # default to per-tier (G4)
         # Devig PBO prices
         imp_a = gdf["price_a"].apply(american_to_implied).astype(float)
         imp_b = gdf["price_b"].apply(american_to_implied).astype(float)
@@ -114,117 +150,141 @@ def main() -> int:
     print(f"  edge_a range:    [{full['edge_a'].min():+.3f}, {full['edge_a'].max():+.3f}]")
     print(f"  overround mean:  {full['overround'].mean():.3f}")
 
-    # --------- Decision: pick side with positive edge, gate by edge mag + market range ---------
+    # --------- Three strategies (G4 part D) ---------
     EDGE_THRESH = 0.03
-    LO, HI = 0.10, 0.90
 
-    def decide(row):
+    def positive_edge_side(row) -> tuple[str, float, float, float]:
+        """Return (side, edge_abs, market_p_bet, price_bet) for whichever
+        side has positive model edge over market.
+        """
         ea = row["edge_a"]
         if ea > 0:
-            side = "a"
-            edge = ea
-            market_p = row["market_p_a"]
-            price = row["price_a"]
+            return "a", float(ea), float(row["market_p_a"]), float(row["price_a"])
+        return "b", float(-ea), float(row["market_p_b"]), float(row["price_b"])
+
+    def decide_global(row):
+        side, edge, mp, price = positive_edge_side(row)
+        bet = (edge >= EDGE_THRESH) and (0.10 <= mp <= 0.90)
+        return pd.Series({"side_global": side if bet else "", "edge_abs_global": edge,
+                          "mp_global": mp, "price_global": price, "bet_global": bool(bet)})
+
+    def decide_mid(row):
+        side, edge, mp, price = positive_edge_side(row)
+        bet = (edge >= EDGE_THRESH) and (0.35 <= mp <= 0.65)
+        return pd.Series({"side_mid": side if bet else "", "edge_abs_mid": edge,
+                          "mp_mid": mp, "price_mid": price, "bet_mid": bool(bet)})
+
+    def decide_heavy(row):
+        # Pick the heavier favorite (mp > 0.85). Bet ML if model agrees within 5pp.
+        ma = float(row["market_p_a"])
+        mb = float(row["market_p_b"])
+        if ma > 0.85:
+            fav_side, fav_mp, fav_price = "a", ma, float(row["price_a"])
+            model_p = float(row["model_p_a"])
+        elif mb > 0.85:
+            fav_side, fav_mp, fav_price = "b", mb, float(row["price_b"])
+            model_p = 1.0 - float(row["model_p_a"])
         else:
-            side = "b"
-            edge = -ea
-            market_p = row["market_p_b"]
-            price = row["price_b"]
-        if edge < EDGE_THRESH:
-            return pd.Series({"bet_side": "", "edge_abs": edge, "market_p_bet": market_p,
-                              "price_bet": price, "bet": False})
-        if market_p < LO or market_p > HI:
-            return pd.Series({"bet_side": "", "edge_abs": edge, "market_p_bet": market_p,
-                              "price_bet": price, "bet": False})
-        return pd.Series({"bet_side": side, "edge_abs": edge, "market_p_bet": market_p,
-                          "price_bet": price, "bet": True})
+            return pd.Series({"side_heavy": "", "mp_heavy": float("nan"),
+                              "price_heavy": float("nan"), "bet_heavy": False})
+        # "Model agrees within 5pp": model thinks the favorite is at least
+        # market_p - 0.05 (we're not betting against the favorite if the
+        # model strongly disagrees). This is the "sanity-check vs naive"
+        # strategy from the bead.
+        agree = model_p >= (fav_mp - 0.05)
+        return pd.Series({"side_heavy": fav_side if agree else "",
+                          "mp_heavy": fav_mp, "price_heavy": fav_price,
+                          "bet_heavy": bool(agree)})
 
-    decisions = full.apply(decide, axis=1)
-    full = pd.concat([full, decisions], axis=1)
-    n_bets = int(full["bet"].sum())
-    print(f"  bets placed: {n_bets} / {len(full)} ({n_bets/len(full)*100:.1f}%)")
+    full = pd.concat([full,
+                      full.apply(decide_global, axis=1),
+                      full.apply(decide_mid, axis=1),
+                      full.apply(decide_heavy, axis=1)], axis=1)
 
-    # --------- PnL ---------
-    def pnl(row, haircut: float):
-        if not row["bet"]:
+    for name in ("global", "mid", "heavy"):
+        n = int(full[f"bet_{name}"].sum())
+        print(f"  bets ({name}): {n} / {len(full)} ({n/len(full)*100:.1f}%)")
+
+    # --------- PnL per strategy ---------
+    def pnl_for(row, name: str, haircut: float) -> float:
+        if not row[f"bet_{name}"]:
             return 0.0
-        won = row["winner_side"] == row["bet_side"]
+        won = row["winner_side"] == row[f"side_{name}"]
+        price = row[f"price_{name}"]
         if haircut > 0:
-            return haircut_payout(row["price_bet"], haircut) if won else -1.0
-        return american_payout(row["price_bet"]) if won else -1.0
+            return haircut_payout(price, haircut) if won else -1.0
+        return american_payout(price) if won else -1.0
 
-    full["pnl"] = full.apply(lambda r: pnl(r, 0.0), axis=1)
-    full["pnl_haircut5"] = full.apply(lambda r: pnl(r, 0.05), axis=1)
+    for name in ("global", "mid", "heavy"):
+        full[f"pnl_{name}"] = full.apply(lambda r, n=name: pnl_for(r, n, 0.0), axis=1)
+        full[f"pnl_{name}_h5"] = full.apply(lambda r, n=name: pnl_for(r, n, 0.05), axis=1)
 
-    # --------- Per-year summary ---------
-    def roi_block(d: pd.DataFrame, label: str = "") -> dict:
-        b = d[d["bet"]]
+    # Back-compat columns for downstream report tooling
+    full["bet_side"] = full["side_global"]
+    full["bet"] = full["bet_global"]
+    full["price_bet"] = full["price_global"]
+    full["pnl"] = full["pnl_global"]
+    full["pnl_haircut5"] = full["pnl_global_h5"]
+
+    # --------- Summary helpers ---------
+    def roi_block(d: pd.DataFrame, strategy: str, label: str = "") -> dict:
+        bet_col = f"bet_{strategy}"
+        side_col = f"side_{strategy}"
+        pnl_col = f"pnl_{strategy}"
+        pnl_h_col = f"pnl_{strategy}_h5"
+        b = d[d[bet_col]]
         n = len(b)
         if n == 0:
-            return {"label": label, "n_bouts": len(d), "n_bets": 0,
+            return {"strategy": strategy, "label": label, "n_bouts": len(d), "n_bets": 0,
                     "hit_rate": float("nan"), "roi_pct": float("nan"),
                     "ci95_pp": float("nan"), "roi_haircut5_pct": float("nan"),
                     "brier_market": float("nan"), "brier_model": float("nan"),
                     "brier_imp_pp": float("nan")}
-        hits = ((b["winner_side"] == b["bet_side"])).mean()
-        roi = b["pnl"].sum() / n * 100.0
-        roi_h = b["pnl_haircut5"].sum() / n * 100.0
-        ci = 1.96 * b["pnl"].std(ddof=1) / math.sqrt(n) * 100.0 if n > 1 else float("nan")
-        # Brier on FULL set (not just bets) using a-perspective
-        y_a = (d["winner_side"] == "a").astype(int)
-        brier_market = ((d["market_p_a"] - y_a) ** 2).mean()
-        brier_model = ((d["model_p_a"] - y_a) ** 2).mean()
-        return {"label": label, "n_bouts": len(d), "n_bets": n,
+        hits = ((b["winner_side"] == b[side_col])).mean()
+        roi = b[pnl_col].sum() / n * 100.0
+        roi_h = b[pnl_h_col].sum() / n * 100.0
+        ci = 1.96 * b[pnl_col].std(ddof=1) / math.sqrt(n) * 100.0 if n > 1 else float("nan")
+        # Brier on the BETS subset (G4: report calibration on bouts where the
+        # strategy actually places a bet — that's where the Brier criterion
+        # matters for paper-betting)
+        y_a = (b["winner_side"] == "a").astype(int)
+        brier_market = ((b["market_p_a"] - y_a) ** 2).mean()
+        brier_model = ((b["model_p_a"] - y_a) ** 2).mean()
+        return {"strategy": strategy, "label": label, "n_bouts": len(d), "n_bets": n,
                 "hit_rate": hits, "roi_pct": roi, "ci95_pp": ci,
                 "roi_haircut5_pct": roi_h,
                 "brier_market": brier_market, "brier_model": brier_model,
                 "brier_imp_pp": (brier_market - brier_model) * 100.0}
 
-    print("\n=== Per-year ROI ===")
-    print(f"{'year':>6} {'bouts':>6} {'bets':>5} {'hit%':>7} {'ROI%':>9} {'±CI95':>8} "
-          f"{'ROIh5%':>9} {'BrierM':>8} {'BrierMd':>9} {'ΔBpp':>7}")
-    rows_summary = []
-    for year, g in full.groupby("year"):
-        s = roi_block(g, label=str(year))
-        rows_summary.append(s)
-        print(f"{s['label']:>6} {s['n_bouts']:>6} {s['n_bets']:>5} "
-              f"{s['hit_rate']*100 if not math.isnan(s['hit_rate']) else float('nan'):>6.1f}% "
-              f"{s['roi_pct']:>+8.2f}% ±{s['ci95_pp']:>5.2f}% "
-              f"{s['roi_haircut5_pct']:>+8.2f}% "
-              f"{s['brier_market']:>8.4f} {s['brier_model']:>9.4f} "
-              f"{s['brier_imp_pp']:>+6.2f}")
-    s_all = roi_block(full, label="ALL")
-    rows_summary.append(s_all)
-    print(f"{'ALL':>6} {s_all['n_bouts']:>6} {s_all['n_bets']:>5} "
-          f"{s_all['hit_rate']*100:>6.1f}% "
-          f"{s_all['roi_pct']:>+8.2f}% ±{s_all['ci95_pp']:>5.2f}% "
-          f"{s_all['roi_haircut5_pct']:>+8.2f}% "
-          f"{s_all['brier_market']:>8.4f} {s_all['brier_model']:>9.4f} "
-          f"{s_all['brier_imp_pp']:>+6.2f}")
+    rows_summary: list[dict] = []
+    holdout = full[full["year"].isin([2024, 2025])]
 
-    # 2024-25 holdout block
-    h = full[full["year"].isin([2024, 2025])]
-    s_h = roi_block(h, label="2024-25 holdout")
-    rows_summary.append(s_h)
-    print(f"\n2024-25 holdout: bouts={s_h['n_bouts']} bets={s_h['n_bets']} "
-          f"ROI={s_h['roi_pct']:+.2f}% ±{s_h['ci95_pp']:.2f}pp  "
-          f"ROIh5={s_h['roi_haircut5_pct']:+.2f}%  "
-          f"BrierΔ={s_h['brier_imp_pp']:+.2f}pp")
-
-    # --------- Per-tier on full set ---------
-    print("\n=== Per-tier ROI (across all years) ===")
-    tiers = [("heavy-fav (mp>=0.65)", full[full["market_p_a"] >= 0.65].copy()),
-             ("mid (0.35..0.65)", full[(full["market_p_a"] >= 0.35) & (full["market_p_a"] < 0.65)].copy()),
-             ("dog (mp<0.35)", full[full["market_p_a"] < 0.35].copy())]
-    for label, g in tiers:
-        s = roi_block(g, label=label)
-        rows_summary.append(s)
-        n_bets = s["n_bets"]
-        if n_bets:
-            print(f"  {label:>22}: bouts={s['n_bouts']:>4} bets={n_bets:>3} hit={s['hit_rate']*100:>5.1f}% "
-                  f"ROI={s['roi_pct']:+.2f}% ±{s['ci95_pp']:.2f}pp  ROIh5={s['roi_haircut5_pct']:+.2f}%")
-        else:
-            print(f"  {label:>22}: bouts={s['n_bouts']:>4} bets=0 (no bets passed gate)")
+    for strategy in ("global", "mid", "heavy"):
+        print(f"\n=== Strategy: {strategy.upper()} — per-year ROI ===")
+        print(f"{'year':>6} {'bouts':>6} {'bets':>5} {'hit%':>7} {'ROI%':>9} {'±CI95':>8} "
+              f"{'ROIh5%':>9} {'BrierM':>8} {'BrierMd':>9} {'ΔBpp':>7}")
+        for year, g in full.groupby("year"):
+            s = roi_block(g, strategy, label=str(year))
+            rows_summary.append(s)
+            hit_str = f"{s['hit_rate']*100:>6.1f}%" if s["n_bets"] else "    -- "
+            roi_str = f"{s['roi_pct']:>+8.2f}%" if s["n_bets"] else "      --"
+            ci_str = f"±{s['ci95_pp']:>5.2f}%" if s["n_bets"] and not math.isnan(s["ci95_pp"]) else "       "
+            roih_str = f"{s['roi_haircut5_pct']:>+8.2f}%" if s["n_bets"] else "      --"
+            print(f"{s['label']:>6} {s['n_bouts']:>6} {s['n_bets']:>5} "
+                  f"{hit_str} {roi_str} {ci_str} {roih_str} "
+                  f"{s['brier_market']:>8.4f} {s['brier_model']:>9.4f} "
+                  f"{s['brier_imp_pp']:>+6.2f}")
+        s_all = roi_block(full, strategy, label="ALL")
+        rows_summary.append(s_all)
+        s_h = roi_block(holdout, strategy, label="2024-25 holdout")
+        rows_summary.append(s_h)
+        print(f"  ALL:            bets={s_all['n_bets']:>3} ROI={s_all['roi_pct']:+.2f}% "
+              f"±{s_all['ci95_pp']:.2f}pp ROIh5={s_all['roi_haircut5_pct']:+.2f}% "
+              f"BrierΔ={s_all['brier_imp_pp']:+.2f}pp")
+        print(f"  2024-25 holdout: bouts={s_h['n_bouts']} bets={s_h['n_bets']} "
+              f"ROI={s_h['roi_pct']:+.2f}% ±{s_h['ci95_pp']:.2f}pp "
+              f"ROIh5={s_h['roi_haircut5_pct']:+.2f}% "
+              f"BrierΔ={s_h['brier_imp_pp']:+.2f}pp")
 
     # Always-favorite naive baseline reference
     fav_side = np.where(full["market_p_a"] >= full["market_p_b"], "a", "b")
